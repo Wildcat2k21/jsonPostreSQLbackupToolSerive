@@ -21,10 +21,8 @@ app.post('/createConnection', async (req, res) => {
 
         // Если подключение уже существует, закрываем его перед созданием нового
         if (customPool){
-            console.log(3);
-            await client.release();
+            // await client.release();
             await customPool.end();
-            console.log(4);
         }
 
         // Получаем данные для подключения из запроса (например, req.body)
