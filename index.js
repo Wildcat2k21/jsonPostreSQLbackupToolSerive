@@ -20,14 +20,7 @@ app.post('/createConnection', async (req, res) => {
     try {
 
         // Если подключение уже существует, закрываем его перед созданием нового
-        if (customPool){
-            await client.release();
-            await customPool.end();
-
-            //очистка переменных
-            client = null;
-            customPool = null;
-        }
+        if (customPool) await closePool();
 
         // Получаем данные для подключения из запроса (например, req.body)
         const dbConnectionIfgo = req.body;
@@ -40,11 +33,146 @@ app.post('/createConnection', async (req, res) => {
 
         res.status(200).send('connection saved');
 
-    } catch (error) {
-        console.error('unexpected error:', error);
-        res.status(500).send('db connection error');
+    } 
+    //обработка ошибок
+    catch(err) {
+
+        //сообщения
+        console.error('unexpected error:', err);
+        res.status(500).send(err.message);
+
+        //очистка переменных (для новой попытки)
+        client = null;
+        customPool = null;
     }
 });
+
+//восстановление таблиц
+app.post('/restoreTables', async (req, res) => {
+    try{
+
+        //проверка, что подключение было создано
+        if(!customPool){
+            return res.status(404).send('needs connection');
+        }
+
+        const sql = req.body.sql;
+
+        //выполнение sql запроса
+        const result = await customPool.query(sql);
+        res.status(200).send('OK');
+
+    }catch(err){
+        console.error('Error creating tables: ', err);
+        res.status(500).send(err.message);
+    }
+});
+
+//данные, ожидающие сохранения
+let restoreData = [];
+
+//восстановление данных
+app.post('/restoreData', async (req, res) => {
+    try{
+
+        //проверка, что подключение было создано
+        if(!customPool){
+            return res.status(404).send('needs connection');
+        }
+
+        // jsonStrPart, isEnd, index, lastIndex
+        const dataPart = req.body;
+
+        //очистка массива с данными
+        if(dataPart.index === 0 && restoreData.length){
+            restoreData.length = 0;
+        }
+
+        let data;
+
+        //добавление данных
+        if(!dataPart.isEnd){
+            restoreData.push(dataPart.jsonStrPart);
+            return res.status(200).send('OK');
+        }
+        else {
+            restoreData.push(dataPart.jsonStrPart);
+            const fullDataString = restoreData.join('');
+            restoreData = [];
+            data = JSON.parse(fullDataString);
+        }
+
+        //нужные таблицы
+        const userTable = data.find(table => table.name === 'plugin_user');
+        const subjectTable = data.find(table => table.name === 'subject');
+        const testTable = data.find(table => table.name === 'test');
+        const questionTable = data.find(table => table.name === 'question');
+        const qestImageTable = data.find(table => table.name === 'question_image');
+        const answerTable = data.find(table => table.name === 'answer');
+        const ansImageTable = data.find(table => table.name === 'answer_image');
+
+        //вставка записей в нужной последовательности
+        await insertInTable(userTable);
+        await insertInTable(subjectTable);
+        await insertInTable(testTable);
+        await insertInTable(questionTable);
+        await insertInTable(qestImageTable);
+        await insertInTable(answerTable);
+        await insertInTable(ansImageTable);
+
+        //успех
+        res.status(200).send('OK');
+
+    }catch(err){
+        console.error('Error pushing data:', err);
+        restoreData = [];
+        res.status(500).send(err.message);
+    }
+});
+
+//закрытие пул соединения
+app.post('/closeConnection', async (req, res) => {
+    try{
+        if(customPool) await closePool();
+        res.status(200).send('OK');
+
+    }catch(err){
+        console.error(err);
+        res.status(500).send(err.message);
+    }
+});
+
+//обновление счетчика id у таблицы
+async function restartTableSequence(tableName){
+    const countResult = await customPool.query(`SELECT COUNT(*) FROM ${tableName}`);
+    const nextval = Number(countResult.rows[0].count) + 1;
+    const sql = `ALTER SEQUENCE ${tableName}_id_seq RESTART WITH ${nextval};`
+    // const sql = `DROP SEQUENCE ${tableName}_id_seq CASCADE; CREATE SEQUENCE ${tableName}_id_seq START ${nextval};`;
+    await customPool.query(sql);
+}
+
+//закрытие подключения
+async function closePool(){
+    await client.release();
+    await customPool.end();
+
+    //очистка переменных
+    client = null;
+    customPool = null;
+}
+
+//вставка данных в таблицы
+async function insertInTable(table){
+    const entries = table.content;
+    //вывод данных
+    for(let entry of entries){
+        const {insertSql, values} = createInsertCommand(table.name, entry);
+        await customPool.query(insertSql, values)
+    }
+
+    //обновление счетчика у таблицы
+    await restartTableSequence(table.name);
+}
 
 //создание резервной копии таблицы
 app.post('/createTableBackup', async (req, res) => {
@@ -88,24 +216,35 @@ app.post('/createTableBackup', async (req, res) => {
 
     } 
     //обработка ошибок
-    catch (error) {
-
-        //если ошибка не связана с поиском таблицы
-        if(error.code !== '42P01'){
-            console.error('creating reserve copy error:', error);
-            return res.status(500).send('Creating reserve copy failed');
+    catch(err) {
+        //таблица не найдена
+        if(err.code === '42P01'){
+            return res.status(404).send('table with that name not exists');
         } 
 
-        //таблица не найдена
-        const response = {
-            status: 404,
-            message: 'table with that name not exists'
-        }
-
-        //если такой таблицы нет
-        res.json(response);
+        //если ошибка не связана с поиском таблицы
+        console.error('creating reserve copy error:', err);
+        return res.status(500).send(err.message);
     }
 });
+
+//создание команды для вставки
+function createInsertCommand(name, entry){
+    const fields = Object.keys(entry);
+    const numbers = Object.keys(entry).map((key, n) => `$${n + 1}`);
+    const insertSql = `INSERT INTO ${name} (${fields.join(', ')}) VALUES (${numbers.join(', ')}) RETURNING *;`;
+    //создание значений для вставки
+    const values = fields.map(key => {
+        let value = entry[key];
+        if((name === 'question_image' && key === 'image')||(name === 'answer_image' && key === 'image') ){
+            value = Buffer.from(value, 'base64');
+        }
+
+        return value;
+    });
+
+    return {insertSql, values}
+}
 
 //разбитие строки json на подстроки для запроса порциями
 async function parseRequestText(jsonString, length, callback){
